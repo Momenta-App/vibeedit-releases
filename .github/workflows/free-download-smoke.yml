@@ -1,0 +1,73 @@
+name: Mac download smoke test
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public VibeEdit release tag
+        required: true
+        default: v1.17.10
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-download-smoke
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Download and verify the public installer on a fresh Apple Silicon Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]
+          test "$(uname -m)" = arm64
+          cd "$RUNNER_TEMP"
+          gh api "repos/Momenta-App/vibeedit-releases/releases/tags/$RELEASE_TAG" > release.json
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          release = json.loads(Path('release.json').read_text())
+          assert not release['draft'], 'Use an existing public release'
+          assets = [a for a in release['assets'] if a['name'].endswith('-mac-arm64.zip')]
+          assert len(assets) == 1, 'Expected one Apple Silicon ZIP'
+          asset = assets[0]
+          assert 0 < asset['size'] < 2 * 1024**3, 'Release asset exceeds the download budget'
+          assert shutil.disk_usage('.').free >= asset['size'] + 8 * 1024**3, 'Insufficient runner disk space'
+          assert asset.get('digest', '').startswith('sha256:'), 'Missing GitHub asset digest'
+          assert asset['browser_download_url'].startswith('https://github.com/Momenta-App/vibeedit-releases/releases/download/'), 'Unexpected asset location'
+          Path('download.url').write_text(asset['browser_download_url'])
+          Path('download.sha256').write_text(asset['digest'][7:] + '  download.zip\n')
+          PY
+          curl --fail --location --retry 2 --max-time 600 --output download.zip "$(cat download.url)"
+          shasum -a 256 --check download.sha256
+          ditto -x -k download.zip installed
+          rm download.zip
+          APP="$RUNNER_TEMP/installed/VibeEdit.app"
+          test -d "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          syspolicy_check distribution "$APP"
+          {
+            echo '### Existing public download'
+            echo "Release: $RELEASE_TAG"
+            sw_vers
+            echo 'ZIP digest, deep signature, stapled ticket and distribution policy passed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          HARNESS="$APP/Contents/Resources/scene-engine-bin/vibeedit-scene"
+          if [ ! -x "$HARNESS" ]; then
+            echo 'The published app has no installed video-analysis CLI/MCP. This older release cannot deliver the current free analysis journey.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/analysis-library"
+          env -i HOME="$HOME" PATH=/usr/bin:/bin TMPDIR="$RUNNER_TEMP/" VIBEEDIT_LIBRARY_ROOT="$RUNNER_TEMP/analysis-library" \
+            "$HARNESS" request '{"operation":"doctor"}' > "$RUNNER_TEMP/doctor.json"
+          cat "$RUNNER_TEMP/doctor.json" >> "$GITHUB_STEP_SUMMARY"
+          echo 'This smoke test does not qualify model installation, perception quality or the complete desktop journey.' >> "$GITHUB_STEP_SUMMARY"
